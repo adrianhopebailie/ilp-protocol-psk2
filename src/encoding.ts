@@ -4,15 +4,9 @@ import * as oer from 'oer-utils'
 import BigNumber from 'bignumber.js'
 import * as Long from 'long'
 import * as constants from './constants'
-
-export interface LegacyPskPacket {
-  type: number,
-  paymentId: Buffer,
-  sequence: number,
-  paymentAmount: BigNumber,
-  chunkAmount: BigNumber,
-  applicationData?: Buffer
-}
+import { SocketInfo, SocketCtrlMessage, SocketCtrlBits } from './socket';
+import { write } from 'fs';
+import { Buffer } from 'buffer';
 
 export enum Type {
   Request = 4,
@@ -24,11 +18,13 @@ export interface PskPacket {
   type: Type,
   requestId: number,
   amount: BigNumber,
-  data: Buffer
+  data: Buffer,
+  socketInfo?: SocketInfo
+  socketCtrl?: SocketCtrlMessage
 }
 
-export function serializePskPacket (sharedSecret: Buffer, pskPacket: PskPacket): Buffer {
-  const {
+export function serializePskPacket (sharedSecret: Buffer, pskPacket: PskPacket, socketCtrl?: SocketCtrlMessage , socketInfo?: SocketInfo): Buffer {
+    const {
     type,
     requestId,
     amount,
@@ -42,6 +38,22 @@ export function serializePskPacket (sharedSecret: Buffer, pskPacket: PskPacket):
   writer.writeUInt32(requestId)
   writer.writeUInt64(bigNumberToHighLow(amount))
   writer.writeVarOctetString(data)
+
+  if(socketInfo && socketCtrl) {
+    let ctrlBits = 0
+    ctrlBits |= socketInfo.isAutoIncrementingTarget ? SocketCtrlBits.IsAutoIncrementing : 0
+    ctrlBits |= socketCtrl.enableAutoIncrementingTarget ? SocketCtrlBits.EnableAutoIncrementing : 0
+    ctrlBits |= socketCtrl.targetDelta.isNegative() ? SocketCtrlBits.TargetDeltaIsNegative : 0
+
+    writer.writeInt(ctrlBits, 1)
+    writer.writeVarOctetString(Buffer.from(socketInfo.address, 'utf8'))
+    writer.writeUInt64(bigNumberToHighLow(socketInfo.balance))
+    writer.writeUInt64(bigNumberToHighLow(socketInfo.targetBalance))
+    writer.writeUInt64(bigNumberToHighLow(socketInfo.sendingRate.shiftedBy(15).decimalPlaces(0, BigNumber.ROUND_DOWN)))
+    writer.writeUInt64(bigNumberToHighLow(socketInfo.mtu))
+    writer.writeUInt64(bigNumberToHighLow(socketCtrl.targetDelta.absoluteValue()))
+  }
+
   const plaintext = writer.getBuffer()
 
   const ciphertext = encrypt(sharedSecret, plaintext)
@@ -54,66 +66,49 @@ export function deserializePskPacket (sharedSecret: Buffer, buffer: Buffer): Psk
 
   const type = reader.readUInt8()
   assert(Type[type], 'PSK packet has unexpected type: ' + type)
+  const requestId = reader.readUInt32()
+  const amount = highLowToBigNumber(reader.readUInt64())
+  const data = reader.readVarOctetString()
+
+  //TODO Is there a better method for this in reader?
+  if(reader.buffer.length > reader.cursor) {
+    const ctrlBits = reader.readInt(1)
+    const isAutoIncrementingTarget = (ctrlBits & SocketCtrlBits.IsAutoIncrementing) > 0
+    const enableAutoIncrementingTarget = (ctrlBits & SocketCtrlBits.EnableAutoIncrementing) > 0
+    const address = reader.readVarOctetString().toString('utf8')
+    const balance = highLowToBigNumber(reader.readUInt64())
+    const targetBalance = highLowToBigNumber(reader.readUInt64())
+    const sendingRate = highLowToBigNumber(reader.readUInt64()).shiftedBy(-15)
+    const mtu = highLowToBigNumber(reader.readUInt64())
+    const targetDelta = highLowToBigNumber(reader.readUInt64())
+
+    return {
+      type,
+      requestId,
+      amount,
+      data,
+      socketCtrl : {
+       enableAutoIncrementingTarget,
+       targetDelta: ((ctrlBits & SocketCtrlBits.TargetDeltaIsNegative) > 0) ? targetDelta.negated() : targetDelta
+      },
+      socketInfo : {
+        address,
+        balance,
+        targetBalance,
+        sendingRate,
+        mtu,
+        isAutoIncrementingTarget
+      }
+    }
+  }
 
   return {
     type,
-    requestId: reader.readUInt32(),
-    amount: highLowToBigNumber(reader.readUInt64()),
-    data: reader.readVarOctetString()
+    requestId,
+    amount,
+    data
   }
-}
 
-/**
- * Serialize and encrypt a Legacy PSK2 packet.
- * The result may be sent as the `data` in an `IlpPrepare`, `IlpFulfill`, or `IlpReject` packet.
- */
-export function serializeLegacyPskPacket (sharedSecret: Buffer, pskPacket: LegacyPskPacket): Buffer {
-  const {
-    type,
-    paymentId,
-    sequence,
-    paymentAmount,
-    chunkAmount,
-    applicationData = Buffer.alloc(0)
-  } = pskPacket
-  assert(Number.isInteger(type) && type < 256, 'type must be a UInt8')
-  assert(Buffer.isBuffer(paymentId) && paymentId.length === 16, 'paymentId must be a 16-byte buffer')
-  assert(Number.isInteger(sequence) && sequence <= constants.MAX_UINT32, 'sequence must be a UInt32')
-  assert(paymentAmount instanceof BigNumber && paymentAmount.isInteger() && paymentAmount.lte(constants.MAX_UINT64), 'paymentAmount must be a UInt64')
-  assert(chunkAmount instanceof BigNumber && chunkAmount.isInteger() && chunkAmount.lte(constants.MAX_UINT64), 'chunkAmount must be a UInt64')
-  assert(Buffer.isBuffer(applicationData), 'applicationData must be a buffer')
-
-  const writer = new oer.Writer()
-  writer.writeUInt8(type)
-  writer.writeOctetString(paymentId, 16)
-  writer.writeUInt32(sequence)
-  writer.writeUInt64(bigNumberToHighLow(paymentAmount))
-  writer.writeUInt64(bigNumberToHighLow(chunkAmount))
-  writer.writeVarOctetString(applicationData)
-  writer.writeUInt8(0) // OER extensibility
-  const contents = writer.getBuffer()
-
-  // TODO add junk data
-
-  const ciphertext = encrypt(sharedSecret, contents)
-  return ciphertext
-}
-
-/**
- * Decrypt and deserialize a Legacy PSK2 packet.
- */
-export function deserializeLegacyPskPacket (sharedSecret: Buffer, ciphertext: Buffer): LegacyPskPacket {
-  const contents = decrypt(sharedSecret, ciphertext)
-  const reader = new oer.Reader(contents)
-
-  return {
-    type: reader.readUInt8(),
-    paymentId: reader.readOctetString(16),
-    sequence: reader.readUInt32(),
-    paymentAmount: highLowToBigNumber(reader.readUInt64()),
-    chunkAmount: highLowToBigNumber(reader.readUInt64()),
-    applicationData: reader.readVarOctetString()
-  }
 }
 
 function encrypt (secret: Buffer, data: Buffer): Buffer {

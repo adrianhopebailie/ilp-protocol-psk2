@@ -5,12 +5,13 @@ import * as crypto from 'crypto'
 import * as Debug from 'debug'
 const debug = Debug('ilp-protocol-psk2:receiver')
 import BigNumber from 'bignumber.js'
-import { default as convertToV2Plugin, PluginV1, PluginV2 } from 'ilp-compat-plugin'
+import { PluginV2 } from 'ilp-compat-plugin'
 import IlpPacket = require('ilp-packet')
 import * as constants from './constants'
 import * as encoding from './encoding'
 import { dataToFulfillment, fulfillmentToCondition } from './condition'
 import * as ILDCP from 'ilp-protocol-ildcp'
+import { SocketInfo, SocketCtrlMessage } from './socket';
 
 const PSK_GENERATION_STRING = 'ilp_psk2_generation'
 const PSK_ADDRESS_FROM_SECRET_STRING = 'ilp_psk2_address_from_secret'
@@ -23,74 +24,38 @@ const SHARED_SECRET_LENGTH = 32
  * The RequestHandler can call [`accept`]{@link RequestHandlerParams.accept} to fulfill the packet or [`reject`]{@link RequestHandlerParams.reject} to reject it.
  */
 export interface RequestHandler {
-  (params: RequestHandlerParams): any
+  (params: RequestHandlerParams): Promise<void>
 }
 
 export interface RequestHandlerParams {
+
   /** If a keyId was passed into [`createAddressAndSecret`]{@link Receiver.createAddressAndSecret}, it will be present here when a packet is sent to that `destinationAccount` */
-  keyId?: Buffer,
+  keyId?: Buffer
+
   /** Indicates whether the request is fulfillable (unfulfillable requests are passed to the handler in case they carry useful application data) */
-  isFulfillable: boolean,
+  isFulfillable: boolean
+
   /** Amount that arrived */
-  amount: BigNumber,
+  amount: BigNumber
+
   /** Data sent by the sender */
-  data: Buffer,
+  data: Buffer
+
   /** Fulfill the packet, and optionally send some data back to the sender */
-  accept: (responseData?: Buffer) => void,
+  accept: (responseData?: Buffer, socketInfo?: SocketInfo, socketCtrl?: SocketCtrlMessage) => void
+
   /** Reject the packet, and optionally send some data back to the sender */
-  reject: (responseData?: Buffer) => void
-}
+  reject: (responseData?: Buffer, socketInfo?: SocketInfo, socketCtrl?: SocketCtrlMessage) => void
 
-/**
- * Review callback that will be called every time the Receiver receives an incoming payment or payment chunk.
- *
- * The payment handler can call the [`accept`]{@link PaymentHandlerParams.accept} or [`reject`]{@link PaymentHandlerParams.reject} methods to fulfill or reject the entire payment.
- */
-export interface PaymentHandler {
-  (params: PaymentHandlerParams): void | Promise<void>
-}
+  socketInfo?: SocketInfo
 
-/**
- * Parameters passed to the Receiver's payment handler callback.
- */
-export interface PaymentHandlerParams {
-  id: Buffer,
-  /** Total amount that should be delivered by this payment.
-   * If the sender has not specified a destination amount, this value will be the maximum UInt64 value or 18446744073709551615.
-   */
-  expectedAmount: string,
-  /**
-   * Accept the entire payment.
-   * The Receiver will automatically fulfill all incoming chunks until the `expectedAmount`
-   * has been delivered or the sender has indicated the payment is finished.
-   *
-   * The Promise returned will resolve to a [`PaymentReceived`]{@link PaymentReceived} when the payment is finished.
-   */
-  accept: () => Promise<PaymentReceived>,
-  /**
-   * Reject the entire payment (and all subsequent chunks with the same `id`).
-   */
-  reject: (message: string) => void,
-  /**
-   * Alternative to `accept` that gives the user more control over the payment chunks they wish to fulfill.
-   * If this method is called, the PaymentHandler callback will be called again for subsequent chunks with the same payment `id`.
-   */
-  acceptSingleChunk: () => void,
-  /**
-   * Alternative to `reject` that gives the user more control over the payment chunks they wish to reject.
-   * If this method is called, the PaymentHandler callback will be called again for subsequent chunks with the same payment `id`.
-   */
-  rejectSingleChunk: (message: string) => void,
-  /**
-   * Details about this prepared chunk; in the form of a parsed interledger packet.
-   */
-  prepare: IlpPacket.IlpPrepare
+  socketCtrl?: SocketCtrlMessage
 }
 
 export interface PaymentReceived {
-  id: Buffer,
-  receivedAmount: string,
-  expectedAmount: string,
+  id: Buffer
+  receivedAmount: string
+  expectedAmount: string
   chunksFulfilled: number
 }
 
@@ -99,11 +64,9 @@ export interface PaymentReceived {
  */
 export interface ReceiverOpts {
   /** Ledger Plugin */
-  plugin: PluginV2 | PluginV1,
-  /** @deprecated */
-  paymentHandler?: PaymentHandler,
+  plugin: PluginV2
   /** Callback for handling incoming packets */
-  requestHandler?: RequestHandler,
+  requestHandler?: RequestHandler
   /** Cryptographic seed that will be used to generate shared secrets for multiple senders */
   secret?: Buffer
 }
@@ -116,28 +79,25 @@ export interface ReceiverOpts {
  * It is recommended to use the [`createReceiver`]{@link createReceiver} function to instantiate Receivers.
  */
 export class Receiver {
-  protected plugin: PluginV2
-  protected secret: Buffer
-  protected requestHandler: RequestHandler
-  protected paymentHandler: PaymentHandler
-  protected address: string
-  protected payments: Object
-  protected connected: boolean
-  protected usingRequestHandlerApi: boolean
-  protected specificRequestHandlers: { [key: string]: { sharedSecret: Buffer, requestHandler: RequestHandler } }
+  
+  //Constructor params
+  private _plugin: PluginV2
+  private _secret: Buffer
+  private _requestHandler: RequestHandler
 
-  constructor (plugin: PluginV2 | PluginV1, secret: Buffer) {
-    // TODO stop accepting PluginV1
-    this.plugin = convertToV2Plugin(plugin)
+  //Set during connect
+  private _baseAddress: string
+  private _connected: boolean
+  private _connectionSpecificRequestHandlers: { [connectionId: string]: { sharedSecret: Buffer, requestHandler: RequestHandler } }
+
+  constructor (plugin: PluginV2, secret: Buffer) {
+    this._plugin = plugin
     assert(secret.length >= 32, 'secret must be at least 32 bytes')
-    this.secret = secret
-    this.paymentHandler = this.defaultPaymentHandler
-    this.address = ''
-    this.payments = {}
-    this.connected = false
-    this.requestHandler = this.defaultRequestHandler
-    this.usingRequestHandlerApi = false
-    this.specificRequestHandlers = {}
+    this._secret = secret
+    this._baseAddress = ''
+    this._connected = false
+    this._requestHandler = Receiver.DefaultRequestHandler
+    this._connectionSpecificRequestHandlers = {}
   }
 
   /**
@@ -145,11 +105,11 @@ export class Receiver {
    */
   async connect (): Promise<void> {
     debug('connect called')
-    await this.plugin.connect()
+    await this._plugin.connect()
     // TODO refetch address if we're connected for long enough
-    this.address = (await ILDCP.fetch(this.plugin.sendData.bind(this.plugin))).clientAddress
-    this.plugin.registerDataHandler(this.handleData)
-    this.connected = true
+    this._baseAddress = (await ILDCP.fetch(this._plugin.sendData.bind(this._plugin))).clientAddress
+    this._plugin.registerDataHandler(this._handleData)
+    this._connected = true
     debug('connected')
   }
 
@@ -158,9 +118,9 @@ export class Receiver {
    */
   async disconnect (): Promise<void> {
     debug('disconnect called')
-    this.connected = false
-    this.plugin.deregisterDataHandler()
-    await this.plugin.disconnect()
+    this._connected = false
+    this._plugin.deregisterDataHandler()
+    await this._plugin.disconnect()
     debug('disconnected')
   }
 
@@ -168,8 +128,8 @@ export class Receiver {
    * Check if the receiver is currently listening for incoming payments.
    */
   isConnected (): boolean {
-    this.connected = this.connected && this.plugin.isConnected()
-    return this.connected
+    this._connected = this._connected && this._plugin.isConnected()
+    return this._connected
   }
 
   /**
@@ -178,40 +138,19 @@ export class Receiver {
    * The user must call `accept` to make the Receiver fulfill the packet.
    */
   registerRequestHandler (handler: RequestHandler): void {
-    if (this.paymentHandler !== this.defaultPaymentHandler) {
-      throw new Error('PaymentHandler and RequestHandler APIs cannot be used at the same time')
+    if(this._requestHandler != Receiver.DefaultRequestHandler) {
+      throw new Error(`A request handler is already registered. Use 'deregisterRequestHandler() to remove it first.'`)
     }
+
     debug('registered request handler')
-    this.usingRequestHandlerApi = true
-    this.requestHandler = handler
+    this._requestHandler = handler
   }
 
   /**
    * Remove the handler callback.
    */
   deregisterRequestHandler (): void {
-    this.requestHandler = this.defaultRequestHandler
-  }
-
-  /**
-   * @deprecated. Switch to [`registerRequestHandler`]{@link Receiver.registerRequestHandler} instead
-   */
-  registerPaymentHandler (handler: PaymentHandler): void {
-    console.warn('DeprecationWarning: registerPaymentHandler is deprecated and will be removed in the next version. Use registerRequestHandler instead')
-    if (this.usingRequestHandlerApi) {
-      throw new Error('PaymentHandler and RequestHandler APIs cannot be used at the same time')
-    }
-    debug('registered payment handler')
-    /* tslint:disable-next-line:strict-type-predicates */
-    assert(typeof handler === 'function', 'payment handler must be a function')
-    this.paymentHandler = handler
-  }
-
-  /**
-   * @deprecated. Use RequestHandlers instead
-   */
-  deregisterPaymentHandler (): void {
-    this.paymentHandler = this.defaultPaymentHandler
+    this._requestHandler = Receiver.DefaultRequestHandler
   }
 
   /**
@@ -224,13 +163,13 @@ export class Receiver {
    * @param keyId Additional segment that will be appended to the destinationAccount and can be used to correlate payments. This is authenticated but **unencrypted** so the entire Interledger will be able to see this value.
    */
   generateAddressAndSecret (keyId?: Buffer): { destinationAccount: string, sharedSecret: Buffer } {
-    assert(this.connected, 'Receiver must be connected')
+    assert(this._connected, 'Receiver must be connected')
     const token = crypto.randomBytes(TOKEN_LENGTH)
     const keygen = (keyId ? Buffer.concat([token, keyId]) : token)
-    const sharedSecret = generateSharedSecret(this.secret, keygen)
+    const sharedSecret = generateSharedSecret(this._secret, keygen)
     return {
       sharedSecret,
-      destinationAccount: `${this.address}.${base64url(keygen)}`
+      destinationAccount: `${this._baseAddress}.${base64url(keygen)}`
     }
   }
 
@@ -244,19 +183,15 @@ export class Receiver {
    * @param handler Callback that will be called when a request comes in for the `destinationAccount` returned by this function
    */
   registerRequestHandlerForSecret (sharedSecret: Buffer, handler: RequestHandler): { destinationAccount: string, sharedSecret: Buffer } {
-    if (this.paymentHandler !== this.defaultPaymentHandler) {
-      throw new Error('PaymentHandler and RequestHandler APIs cannot be used at the same time')
-    }
-    this.usingRequestHandlerApi = true
 
-    const generator = hmac(this.secret, Buffer.from(PSK_ADDRESS_FROM_SECRET_STRING, 'utf8'))
+    const generator = hmac(this._secret, Buffer.from(PSK_ADDRESS_FROM_SECRET_STRING, 'utf8'))
     const addressSuffix = base64url(hmac(generator, sharedSecret).slice(0, TOKEN_LENGTH))
 
-    if (this.specificRequestHandlers[addressSuffix]) {
+    if (this._connectionSpecificRequestHandlers[addressSuffix]) {
       throw new Error('RequestHandler already registered for that sharedSecret. The old handler must be deregistered first before another one is added')
     }
 
-    this.specificRequestHandlers[addressSuffix] = {
+    this._connectionSpecificRequestHandlers[addressSuffix] = {
       sharedSecret,
       requestHandler: handler
     }
@@ -264,7 +199,7 @@ export class Receiver {
 
     return {
       sharedSecret,
-      destinationAccount: `${this.address}.${addressSuffix}`
+      destinationAccount: `${this._baseAddress}.${addressSuffix}`
     }
   }
 
@@ -272,38 +207,33 @@ export class Receiver {
    * Remove the requestHandler for a specific sharedSecret. Does nothing if there is no handler registered
    */
   deregisterRequestHandlerForSecret (sharedSecret: Buffer): void {
-    const generator = hmac(this.secret, Buffer.from(PSK_ADDRESS_FROM_SECRET_STRING, 'utf8'))
+    const generator = hmac(this._secret, Buffer.from(PSK_ADDRESS_FROM_SECRET_STRING, 'utf8'))
     const addressSuffix = base64url(hmac(generator, sharedSecret).slice(0, TOKEN_LENGTH))
 
-    if (this.specificRequestHandlers[addressSuffix]) {
-      delete this.specificRequestHandlers[addressSuffix]
+    if (this._connectionSpecificRequestHandlers[addressSuffix]) {
+      delete this._connectionSpecificRequestHandlers[addressSuffix]
       debug(`removed specific request handler for address suffix: ${addressSuffix}`)
     } else {
       debug(`tried to remove specific request handler for address suffix: ${addressSuffix}, but there was no handler registerd`)
     }
   }
 
-  protected async defaultPaymentHandler (params: PaymentHandlerParams): Promise<void> {
-    debug(`Receiver has no handler registered, rejecting payment ${params.id.toString('hex')}`)
-    return params.reject('Receiver has no payment handler registered')
-  }
-
-  protected async defaultRequestHandler (params: RequestHandlerParams): Promise<void> {
+  static DefaultRequestHandler = async (params: RequestHandlerParams): Promise<void> => {
     debug(`Receiver has no handler registered, rejecting request of amount: ${params.amount} with data: ${params.data.toString('hex')}`)
     return params.reject(Buffer.alloc(0))
   }
 
-  protected reject (code: string, message?: string, data?: Buffer) {
+  private reject (code: string, message?: string, data?: Buffer) {
     return IlpPacket.serializeIlpReject({
       code,
       message: message || '',
       data: data || Buffer.alloc(0),
-      triggeredBy: this.address
+      triggeredBy: this._baseAddress
     })
   }
 
   // This is an arrow function so we don't need to use bind when setting it on the plugin
-  protected handleData = async (data: Buffer): Promise<Buffer> => {
+  private _handleData = async (data: Buffer): Promise<Buffer> => {
     let prepare: IlpPacket.IlpPrepare
     let sharedSecret: Buffer
     let requestHandler: RequestHandler
@@ -316,356 +246,92 @@ export class Receiver {
       return this.reject('F06', 'Packet is not an IlpPrepare')
     }
 
-    const localParts = prepare.destination.replace(this.address + '.', '').split('.')
+    const localParts = prepare.destination.replace(this._baseAddress + '.', '').split('.')
     if (localParts.length === 0) {
       return this.reject('F02', 'Packet is not for this receiver')
     }
-    if (this.specificRequestHandlers[localParts[0]]) {
-      requestHandler = this.specificRequestHandlers[localParts[0]].requestHandler
-      sharedSecret = this.specificRequestHandlers[localParts[0]].sharedSecret
+    if (this._connectionSpecificRequestHandlers[localParts[0]]) {
+      requestHandler = this._connectionSpecificRequestHandlers[localParts[0]].requestHandler
+      sharedSecret = this._connectionSpecificRequestHandlers[localParts[0]].sharedSecret
     } else {
       const keygen = Buffer.from(localParts[0], 'base64')
       if (keygen.length > TOKEN_LENGTH) {
         keyId = keygen.slice(TOKEN_LENGTH)
       }
-      sharedSecret = generateSharedSecret(this.secret, keygen)
-      requestHandler = this.requestHandler.bind(this)
+      sharedSecret = generateSharedSecret(this._secret, keygen)
+      requestHandler = this._requestHandler.bind(this)
     }
 
     let packet
-    let isLegacy
     try {
       packet = encoding.deserializePskPacket(sharedSecret, prepare.data)
-      isLegacy = false
     } catch (err) {
-      try {
-        packet = encoding.deserializeLegacyPskPacket(sharedSecret, prepare.data)
-        isLegacy = true
-      } catch (err) {
-        debug('unable to parse PSK packet, either because it is an unrecognized type or because the data has been tampered with:', JSON.stringify(prepare), err && err.message)
-        // TODO should this be a different error?
-        return this.reject('F06', 'Unable to parse data')
-      }
+      debug('unable to parse PSK packet, either because it is an unrecognized type or because the data has been tampered with:', JSON.stringify(prepare), err && err.message)
+      // TODO should this be a different error?
+      return this.reject('F06', 'Unable to parse data')
     }
-    // Support the old PaymentHandler API for now
-    if (this.usingRequestHandlerApi && !isLegacy) {
-      if (packet.type !== encoding.Type.Request) {
-        // TODO should this be a different error?
-        debug('packet is not a PSK Request (should be type 4):', packet)
-        return this.reject('F06', 'Unexpected packet type')
-      }
-      packet = packet as encoding.PskPacket
+    if (packet.type !== encoding.Type.Request) {
+      // TODO should this be a different error?
+      debug('packet is not a PSK Request (should be type 4):', packet)
+      return this.reject('F06', 'Unexpected packet type')
+    }
+    packet = packet as encoding.PskPacket
 
-      let isFulfillable = false
-      let errorCode = 'F99'
-      let errorMessage = ''
+    let isFulfillable = false
+    let errorCode = 'F99'
+    let errorMessage = ''
 
-      // Check if we can regenerate the correct fulfillment
-      let fulfillment: Buffer
-      try {
-        fulfillment = dataToFulfillment(sharedSecret, prepare.data)
-        const generatedCondition = fulfillmentToCondition(fulfillment)
-        if (generatedCondition.equals(prepare.executionCondition)) {
-          isFulfillable = true
-        } else {
-          isFulfillable = false
-          errorCode = 'F05'
-          errorMessage = 'Condition generated does not match prepare'
-          debug(`condition generated does not match. expected: ${prepare.executionCondition.toString('base64')}, actual: ${generatedCondition.toString('base64')}`)
-
-        }
-      } catch (err) {
+    // Check if we can regenerate the correct fulfillment
+    let fulfillment: Buffer
+    try {
+      fulfillment = dataToFulfillment(sharedSecret, prepare.data)
+      const generatedCondition = fulfillmentToCondition(fulfillment)
+      if (generatedCondition.equals(prepare.executionCondition)) {
+        isFulfillable = true
+      } else {
         isFulfillable = false
         errorCode = 'F05'
-        errorMessage = 'Condition does not match prepare'
-        debug('unable to generate fulfillment from data:', err)
-      }
+        errorMessage = 'Condition generated does not match prepare'
+        debug(`condition generated does not match. expected: ${prepare.executionCondition.toString('base64')}, actual: ${generatedCondition.toString('base64')}`)
 
-      // Check if the amount we received is enough
-      if (packet.amount.greaterThan(prepare.amount)) {
-        isFulfillable = false
-        debug(`incoming transfer amount too low. actual: ${prepare.amount}, expected: ${packet.amount}`)
       }
+    } catch (err) {
+      isFulfillable = false
+      errorCode = 'F05'
+      errorMessage = 'Condition does not match prepare'
+      debug('unable to generate fulfillment from data:', err)
+    }
 
-      const { fulfill, responseData } = await callRequestHandler(requestHandler, isFulfillable, packet.requestId, prepare.amount, packet.data, keyId)
-      if (fulfill && isFulfillable) {
-        return IlpPacket.serializeIlpFulfill({
-          /* tslint:disable-next-line:no-unnecessary-type-assertion */
-          fulfillment: fulfillment!,
-          data: encoding.serializePskPacket(sharedSecret, {
-            type: encoding.Type.Response,
-            requestId: packet.requestId,
-            amount: new BigNumber(prepare.amount),
-            data: responseData
-          })
-        })
-      } else {
-        return this.reject(errorCode, errorMessage, encoding.serializePskPacket(sharedSecret, {
-          type: encoding.Type.Error,
+    // Check if the amount we received is enough
+    if (packet.amount.isGreaterThan(prepare.amount)) {
+      isFulfillable = false
+      debug(`incoming transfer amount too low. actual: ${prepare.amount}, expected: ${packet.amount}`)
+    }
+
+    const { fulfill, responseData, responseSocketInfo, responseSocketCtrl } = await callRequestHandler(requestHandler, isFulfillable, packet.requestId, prepare.amount, 
+      packet.data, keyId, packet.socketInfo, packet.socketCtrl)
+    if (fulfill && isFulfillable) {
+      return IlpPacket.serializeIlpFulfill({
+        /* tslint:disable-next-line:no-unnecessary-type-assertion */
+        fulfillment: fulfillment!,
+        data: encoding.serializePskPacket(sharedSecret, {
+          type: encoding.Type.Response,
           requestId: packet.requestId,
           amount: new BigNumber(prepare.amount),
-          data: responseData
-        }))
-      }
-    } else if (this.usingRequestHandlerApi && isLegacy) {
-      // Legacy packets (will be removed soon)
-      if (packet.type !== constants.TYPE_PSK2_CHUNK && packet.type !== constants.TYPE_PSK2_LAST_CHUNK) {
-        debug('got packet with unrecognized PSK type: ', packet)
-        // TODO should this be a different error?
-        return this.reject('F06', 'Unsupported type')
-      }
-
-      packet = packet as encoding.LegacyPskPacket
-
-      // Transfer amount too low
-      if (packet.chunkAmount.gt(prepare.amount)) {
-        debug(`incoming transfer amount too low. actual: ${prepare.amount}, expected: ${packet.chunkAmount.toString(10)}`)
-        return this.reject('F99', '', encoding.serializeLegacyPskPacket(sharedSecret, {
-          type: constants.TYPE_PSK2_REJECT,
-          paymentId: packet.paymentId,
-          sequence: packet.sequence,
-          chunkAmount: new BigNumber(prepare.amount),
-          paymentAmount: new BigNumber(0)
-        }))
-      }
-
-      // Check if we can regenerate the correct fulfillment
-      let fulfillment
-      try {
-        fulfillment = dataToFulfillment(sharedSecret, prepare.data)
-        const generatedCondition = fulfillmentToCondition(fulfillment)
-        assert(generatedCondition.equals(prepare.executionCondition), `condition generated does not match. expected: ${prepare.executionCondition.toString('base64')}, actual: ${generatedCondition.toString('base64')}`)
-      } catch (err) {
-        debug('error regenerating fulfillment:', err)
-        return this.reject('F05', 'Condition generated does not match prepare', encoding.serializeLegacyPskPacket(sharedSecret, {
-          type: constants.TYPE_PSK2_REJECT,
-          paymentId: packet.paymentId,
-          sequence: packet.sequence,
-          paymentAmount: new BigNumber(0),
-          chunkAmount: new BigNumber(prepare.amount),
-          applicationData: Buffer.alloc(0)
-        }))
-      }
-
-      const compatibilityData = Buffer.alloc(20)
-      packet.paymentId.copy(compatibilityData)
-      compatibilityData.writeUInt32BE(packet.sequence, 16)
-
-      const { fulfill } = await callRequestHandler(requestHandler, true, packet.sequence, prepare.amount, compatibilityData, keyId)
-      if (fulfill) {
-        return IlpPacket.serializeIlpFulfill({
-          fulfillment,
-          data: encoding.serializeLegacyPskPacket(sharedSecret, {
-            type: constants.TYPE_PSK2_FULFILLMENT,
-            paymentId: packet.paymentId,
-            sequence: packet.sequence,
-            paymentAmount: new BigNumber(0),
-            chunkAmount: new BigNumber(prepare.amount),
-            applicationData: Buffer.alloc(0)
-          })
-        })
-      } else {
-        return this.reject('F99', '', encoding.serializeLegacyPskPacket(sharedSecret, {
-          type: constants.TYPE_PSK2_REJECT,
-          paymentId: packet.paymentId,
-          sequence: packet.sequence,
-          paymentAmount: new BigNumber(0),
-          chunkAmount: new BigNumber(prepare.amount),
-          applicationData: Buffer.alloc(0)
-        }))
-      }
+          data: responseData,
+          socketInfo: responseSocketInfo,
+          socketCtrl: responseSocketCtrl
+        }, undefined)
+      })
     } else {
-      // Legacy PaymentHandler API (will be removed soon)
-      let request: encoding.LegacyPskPacket
-      try {
-        request = encoding.deserializeLegacyPskPacket(sharedSecret, prepare.data)
-      } catch (err) {
-        debug('error decrypting data:', err)
-        return this.reject('F06', 'Unable to parse data')
-      }
-
-      if ([constants.TYPE_PSK2_CHUNK, constants.TYPE_PSK2_LAST_CHUNK].indexOf(request.type) === -1) {
-        debug(`got unexpected request type: ${request.type}`)
-        // TODO should this be a different error code?
-        // (this might be a sign that they're using a different version of the protocol)
-        // TODO should this type of response be encrypted?
-        return this.reject('F06', 'Unexpected request type')
-      }
-
-      const paymentId = request.paymentId.toString('hex')
-      let record = this.payments[paymentId]
-      if (!record) {
-        record = {
-          // TODO buffer user data and keep track of sequence numbers
-          received: new BigNumber(0),
-          expected: new BigNumber(0),
-          finished: false,
-          finishedPromise: null,
-          acceptedByReceiver: null,
-          rejectionMessage: 'rejected by receiver',
-          chunksFulfilled: 0,
-          chunksRejected: 0 // doesn't include chunks we cannot parse
-        }
-        this.payments[paymentId] = record
-      }
-      record.expected = request.paymentAmount
-
-      const rejectTransfer = (message: string) => {
-        debug(`rejecting transfer ${request.sequence} of payment ${paymentId}: ${message}`)
-        record.chunksRejected += 1
-        const data = encoding.serializeLegacyPskPacket(sharedSecret, {
-          type: constants.TYPE_PSK2_REJECT,
-          paymentId: request.paymentId,
-          sequence: request.sequence,
-          paymentAmount: record.received,
-          chunkAmount: new BigNumber(prepare.amount)
-        })
-        return this.reject('F99', '', data)
-      }
-
-      // Transfer amount too low
-      if (request.chunkAmount.gt(prepare.amount)) {
-        return rejectTransfer(`incoming transfer amount too low. actual: ${prepare.amount}, expected: ${request.chunkAmount.toString(10)}`)
-      }
-
-      // Payment is already finished
-      if (record.finished) {
-        // TODO should this return an F99 or something else?
-        return rejectTransfer(`payment is already finished`)
-      }
-
-      // TODO should we reject an incoming chunk if it would put us too far over the expected amount?
-
-      // Check if we can regenerate the correct fulfillment
-      let fulfillment
-      try {
-        fulfillment = dataToFulfillment(sharedSecret, prepare.data)
-        const generatedCondition = fulfillmentToCondition(fulfillment)
-        assert(generatedCondition.equals(prepare.executionCondition), `condition generated does not match. expected: ${prepare.executionCondition.toString('base64')}, actual: ${generatedCondition.toString('base64')}`)
-      } catch (err) {
-        debug('error regenerating fulfillment:', err)
-        record.chunksRejected += 1
-        return this.reject('F05', 'condition generated does not match prepare')
-      }
-
-      // Check if the receiver wants to accept the payment
-      let chunkAccepted = !!record.acceptedByReceiver
-      let userCalledAcceptOrReject = false
-      if (record.acceptedByReceiver === null) {
-        // This promise resolves when the user has either accepted or rejected the payment
-        await new Promise(async (resolve, reject) => {
-          // Reject the payment if:
-          // a) the user explicity calls reject
-          // b) if they don't call accept
-          // c) if there is an error thrown in the payment handler
-          try {
-            await Promise.resolve(this.paymentHandler({
-              // TODO include first chunk data
-              id: request.paymentId,
-              expectedAmount: record.expected.toString(10),
-              accept: async (): Promise<PaymentReceived> => {
-                userCalledAcceptOrReject = true
-                // Resolve the above promise so that we actually fulfill the incoming chunk
-                record.acceptedByReceiver = true
-                chunkAccepted = true
-                resolve()
-
-                // The promise returned to the receiver will be fulfilled
-                // when the whole payment is finished
-                const payment = await new Promise((resolve, reject) => {
-                  record.finishedPromise = { resolve, reject }
-                  // TODO should the payment timeout after some time?
-                }) as PaymentReceived
-
-                return payment
-              },
-              reject: (message: string) => {
-                userCalledAcceptOrReject = true
-                debug('receiver rejected payment with message:', message)
-                record.acceptedByReceiver = false
-                record.rejectionMessage = message
-                record.finished = false
-                // TODO check that the message isn't too long
-              },
-              // TODO throw error if you've waited too long and it's expired
-              acceptSingleChunk: (): void => {
-                userCalledAcceptOrReject = true
-                chunkAccepted = true
-                record.acceptedByReceiver = null
-                resolve()
-              },
-              rejectSingleChunk: (message: string) => {
-                userCalledAcceptOrReject = true
-                chunkAccepted = false
-                record.acceptedByReceiver = null
-                record.rejectionMessage = message
-                resolve()
-                // TODO check that the message isn't too long
-              },
-              prepare
-            }))
-
-            // If the user didn't call the accept function, reject it
-            if (!userCalledAcceptOrReject) {
-              record.acceptedByReceiver = false
-              record.rejectionMessage = 'receiver did not accept the payment'
-              record.finished = true
-            }
-          } catch (err) {
-            debug('error thrown in payment handler:', err)
-            record.acceptedByReceiver = false
-            record.rejectionMessage = err && err.message
-          }
-          resolve()
-        })
-      }
-
-      // Reject the chunk if the receiver rejected the whole payment
-      if (record.acceptedByReceiver === false) {
-        debug(`rejecting chunk because payment ${paymentId} was rejected by receiver with message: ${record.rejectionMessage}`)
-        record.chunksRejected += 1
-        return this.reject('F99', record.rejectionMessage)
-      }
-
-      // Reject the chunk of the receiver rejected the specific chunk
-      if (!chunkAccepted) {
-        debug(`rejecting chunk ${request.sequence} of payment ${paymentId} because it was rejected by the receiver with the message: ${record.rejectionMessage}`)
-        record.chunksRejected += 1
-        return this.reject('F99', record.rejectionMessage)
-      }
-
-      // Update stats based on that chunk
-      record.chunksFulfilled += 1
-      record.received = record.received.plus(prepare.amount)
-      if (record.received.gte(record.expected) || request.type === constants.TYPE_PSK2_LAST_CHUNK) {
-        record.finished = true
-        record.finishedPromise && record.finishedPromise.resolve({
-          id: request.paymentId,
-          receivedAmount: record.received.toString(10),
-          expectedAmount: record.expected.toString(10),
-          chunksFulfilled: record.chunksFulfilled,
-          chunksRejected: record.chunksRejected
-          // TODO add data
-        })
-      }
-
-      debug(`got ${record.finished ? 'last ' : ''}chunk of amount ${prepare.amount} for payment: ${paymentId}. total received: ${record.received.toString(10)}`)
-
-      // Let the sender know how much has arrived
-      const response = encoding.serializeLegacyPskPacket(sharedSecret, {
-        type: constants.TYPE_PSK2_FULFILLMENT,
-        paymentId: request.paymentId,
-        sequence: request.sequence,
-        paymentAmount: record.received,
-        chunkAmount: new BigNumber(prepare.amount)
-      })
-
-      debug(`fulfilling transfer ${request.sequence} for payment ${paymentId} with fulfillment: ${fulfillment.toString('base64')}`)
-
-      return IlpPacket.serializeIlpFulfill({
-        fulfillment,
-        data: response
-      })
+      return this.reject(errorCode, errorMessage, encoding.serializePskPacket(sharedSecret, {
+        type: encoding.Type.Error,
+        requestId: packet.requestId,
+        amount: new BigNumber(prepare.amount),
+        data: responseData,
+        socketInfo: responseSocketInfo,
+        socketCtrl: responseSocketCtrl
+  }, undefined))
     }
   }
 }
@@ -691,14 +357,10 @@ export class Receiver {
 export async function createReceiver (opts: ReceiverOpts): Promise<Receiver> {
   const {
     plugin,
-    paymentHandler,
     requestHandler,
     secret = crypto.randomBytes(32)
   } = opts
   const receiver = new Receiver(plugin, secret)
-  if (paymentHandler) {
-    receiver.registerPaymentHandler(paymentHandler)
-  }
   if (requestHandler) {
     receiver.registerRequestHandler(requestHandler)
   }
@@ -706,10 +368,14 @@ export async function createReceiver (opts: ReceiverOpts): Promise<Receiver> {
   return receiver
 }
 
-async function callRequestHandler (requestHandler: RequestHandler, isFulfillable: boolean, requestId: number, amount: string, data: Buffer, keyId?: Buffer): Promise<{ fulfill: boolean, responseData: Buffer }> {
+async function callRequestHandler (requestHandler: RequestHandler, isFulfillable: boolean, requestId: number, amount: string, data: Buffer, 
+  keyId?: Buffer, socketInfo?: SocketInfo, socketCtrl?: SocketCtrlMessage): 
+Promise<{ fulfill: boolean, responseData: Buffer, responseSocketInfo?: SocketInfo, responseSocketCtrl?: SocketCtrlMessage}> {
   let fulfill = false
   let finalized = false
   let responseData = Buffer.alloc(0)
+  let responseSocketInfo : SocketInfo | undefined = undefined
+  let responseSocketCtrl : SocketCtrlMessage | undefined = undefined
 
   // This promise resolves when the user has either accepted or rejected the payment
   await new Promise(async (resolve, reject) => {
@@ -718,12 +384,12 @@ async function callRequestHandler (requestHandler: RequestHandler, isFulfillable
     // b) if they don't call accept
     // c) if there is an error thrown in the request handler
     try {
-      await Promise.resolve(requestHandler({
+      await requestHandler({
         isFulfillable,
         keyId,
         amount: (isFulfillable ? new BigNumber(amount) : new BigNumber(0)),
         data,
-        accept: (userResponse = Buffer.alloc(0)) => {
+        accept: (userResponse = Buffer.alloc(0), userSocketInfo?: SocketInfo, userSocketCtrl? : SocketCtrlMessage) => {
           if (finalized) {
             throw new Error(`Packet was already ${fulfill ? 'fulfilled' : 'rejected'}`)
           }
@@ -733,19 +399,25 @@ async function callRequestHandler (requestHandler: RequestHandler, isFulfillable
           finalized = true
           fulfill = true
           responseData = userResponse
+          responseSocketInfo = userSocketInfo
+          responseSocketCtrl = userSocketCtrl
           debug(`user accepted packet with requestId ${requestId}${keyId ? ' for keyId: ' + base64url(keyId) : ''}`)
           resolve()
         },
-        reject: (userResponse = Buffer.alloc(0)) => {
+        reject: (userResponse = Buffer.alloc(0), userSocketInfo?: SocketInfo, userSocketCtrl? : SocketCtrlMessage) => {
           if (finalized) {
             throw new Error(`Packet was already ${fulfill ? 'fulfilled' : 'rejected'}`)
           }
           finalized = true
           responseData = userResponse
+          responseSocketInfo = userSocketInfo
+          responseSocketCtrl = userSocketCtrl
           debug(`user rejected packet with requestId: ${requestId}${keyId ? ' for keyId: ' + base64url(keyId) : ''}`)
           resolve()
-        }
-      }))
+        },
+        socketInfo,
+        socketCtrl
+      })
     } catch (err) {
       debug('error in requestHandler, going to reject the packet:', err)
     }
@@ -758,8 +430,10 @@ async function callRequestHandler (requestHandler: RequestHandler, isFulfillable
 
   return {
     fulfill,
-    responseData
-  }
+    responseData,
+    responseSocketInfo,
+    responseSocketCtrl
+}
 }
 
 function generateSharedSecret (secret: Buffer, token: Buffer): Buffer {

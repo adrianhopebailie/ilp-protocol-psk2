@@ -17,6 +17,7 @@ export const IV_LENGTH = 12
 export const AUTH_TAG_LENGTH = 16
 
 // Integers
+export const ZERO = new BigNumber('18446744073709551615')
 export const MAX_UINT8 = 255
 export const MAX_UINT32 = 4294967295
 export const MAX_UINT64 = new BigNumber('18446744073709551615')

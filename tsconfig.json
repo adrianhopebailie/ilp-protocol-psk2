@@ -15,5 +15,5 @@
     "ilp-packet",
     "ilp-compat-plugin"
   ],
-  "compileOnSave": true
+  "compileOnSave": true,
 }
